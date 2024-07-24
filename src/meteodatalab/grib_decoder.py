@@ -80,8 +80,13 @@ class _FieldBuffer:
             self.dims = tuple(DIM_MAP[d] for d in dim_keys) + ("y", "x")
 
         if not self.metadata:
+            try:
+                stream = io.BytesIO(field.message())
+                [md] = (f.metadata() for f in ekd.from_source("stream", stream))
+            except NotImplementedError:
+                md = field.metadata()
             self.metadata = {
-                "message": field.message(),
+                "message": md,
                 **metadata.extract(field.metadata()),
             }
 
@@ -351,8 +356,7 @@ def save(
         msg = "The message attribute is required to write to the GRIB format."
         raise ValueError(msg)
 
-    stream = io.BytesIO(field.message)
-    [md] = (f.metadata() for f in ekd.from_source("stream", stream))
+    md = field.message
 
     idx = {
         dim: field.coords[key]
