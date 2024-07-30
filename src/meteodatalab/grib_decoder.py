@@ -26,6 +26,7 @@ DIM_MAP = {
     "level": "z",
     "perturbationNumber": "eps",
     "step": "time",
+    "ref_time": "ref_time"
 }
 INV_DIM_MAP = {v: k for k, v in DIM_MAP.items()}
 
@@ -69,13 +70,17 @@ class _FieldBuffer:
             else ("step", "level")
         )
         key = field.metadata(*dim_keys)
+        dataDate, dataTime = field.metadata("dataDate","dataTime")
+        key =  ( _parse_datetime(dataDate, dataTime), ) + key
+        dim_keys = ('ref_time',) + dim_keys
+
         logger.debug("Received field for param: %s, key: %s", name, key)
         self.values[key] = field.to_numpy(dtype=np.float32)
 
-        step = key[-2]  # assume all members share the same time steps
-        if step not in self.time_meta:
-            self.time_meta[step] = field.metadata(namespace="time")
+        time_dims = (key[0], key[-2])  # assume all members share the same time steps
 
+        if time_dims not in self.time_meta:
+            self.time_meta[time_dims] = field.metadata(namespace="time")
         if not self.dims:
             self.dims = tuple(DIM_MAP[d] for d in dim_keys) + ("y", "x")
 
@@ -97,6 +102,7 @@ class _FieldBuffer:
 
         coord_values = zip(*self.values)
         unique = (sorted(set(values)) for values in coord_values)
+
         coords = {dim: c for dim, c in zip(self.dims[:-2], unique)}
 
         if missing := [
@@ -112,23 +118,21 @@ class _FieldBuffer:
         shape = tuple(len(v) for v in coords.values()) + (ny, nx)
         return coords, shape
 
-    def _gather_tcoords(self):
-        time = None
-        valid_time = []
-        for step in sorted(self.time_meta):
-            tm = self.time_meta[step]
-            valid_time.append(_parse_datetime(tm["validityDate"], tm["validityTime"]))
-            if time is None:
-                time = _parse_datetime(tm["dataDate"], tm["dataTime"])
+    def _gather_tcoords(self, coords):
+        import itertools
+        import datetime
+        vtime_coords = np.empty(shape=(len(coords['ref_time'])*len(coords['time'])), dtype=datetime.datetime)
 
-        return {"valid_time": ("time", valid_time), "ref_time": time}
+        for idx, (ref_time,step) in enumerate(itertools.product(coords['ref_time'], coords['time'])):
+            vtime_coords[idx] = _parse_datetime(self.time_meta[(ref_time, step)]['validityDate'], self.time_meta[(ref_time, step)]['validityTime'])
+        return {'valid_time': (("ref_time","time"), np.reshape(vtime_coords, (len(coords['ref_time']), len(coords['time']))))}
 
     def to_xarray(self) -> xr.DataArray:
         if not self.values:
             raise MissingData("No values.")
 
         coords, shape = self._gather_coords()
-        tcoords = self._gather_tcoords()
+        tcoords = self._gather_tcoords(coords)
 
         array = xr.DataArray(
             data=np.array(
@@ -232,7 +236,6 @@ def load(
         except MissingData as e:
             raise RuntimeError(f"Missing data for param: {name}") from e
     return result
-
 
 class GribReader:
     def __init__(
@@ -361,7 +364,14 @@ def save(
     }
 
     def to_grib(loc: dict[str, xr.DataArray]):
-        return {INV_DIM_MAP[key]: value.item() for key, value in loc.items()}
+        result={}
+        for key,value in loc.items():
+            if key == "ref_time":
+                result["dataDate"] = value.item().strftime("%Y%m%d")
+                result["dataTime"] = value.item().strftime("%H%M")
+            else:
+                result[INV_DIM_MAP[key]]= value.item()
+        return result
 
     for idx_slice in product(*idx.values()):
         loc = {dim: value for dim, value in zip(idx.keys(), idx_slice)}
@@ -370,7 +380,6 @@ def save(
 
         fs = ekd.FieldList.from_numpy(array, metadata)
         fs.write(file_handle, bits_per_value=bits_per_value)
-
 
 def get_code_flag(value: int, indices: Sequence[int]) -> list[bool]:
     """Get the code flag value at the given indices.
