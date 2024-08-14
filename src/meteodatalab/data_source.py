@@ -27,9 +27,9 @@ def cosmo_grib_defs():
         root_dir / "eccodes-cosmo-resources/definitions",
         Path(restore),
     )
-    for path in paths:
-        if not path.exists():
-            raise RuntimeError(f"{path} does not exist")
+#    for path in paths:
+#        if not path.exists():
+#            raise RuntimeError(f"{path} does not exist")
     defs_path = ":".join(map(str, paths))
     eccodes.codes_set_definitions_path(defs_path)
     try:

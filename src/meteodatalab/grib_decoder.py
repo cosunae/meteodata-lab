@@ -26,6 +26,7 @@ DIM_MAP = {
     "level": "z",
     "perturbationNumber": "eps",
     "step": "time",
+    "ref_time": "ref_time"
 }
 INV_DIM_MAP = {v: k for k, v in DIM_MAP.items()}
 
@@ -69,19 +70,29 @@ class _FieldBuffer:
             else ("step", "level")
         )
         key = field.metadata(*dim_keys)
+        dataDate, dataTime = field.metadata("dataDate","dataTime")
+        key =  ( _parse_datetime(dataDate, dataTime), ) + key
+        dim_keys = ('ref_time',) + dim_keys
+
         logger.debug("Received field for param: %s, key: %s", name, key)
         self.values[key] = field.to_numpy(dtype=np.float32)
 
-        step = key[-2]  # assume all members share the same time steps
-        if step not in self.time_meta:
-            self.time_meta[step] = field.metadata(namespace="time")
+        time_dims = (key[0], key[-2])  # assume all members share the same time steps
 
+        if time_dims not in self.time_meta:
+            self.time_meta[time_dims] = field.metadata(namespace="time")
         if not self.dims:
             self.dims = tuple(DIM_MAP[d] for d in dim_keys) + ("y", "x")
 
         if not self.metadata:
+            try:
+                stream = io.BytesIO(field.message())
+                [md] = (f.metadata() for f in ekd.from_source("stream", stream))
+            except NotImplementedError:
+                md = field.metadata()
+
             self.metadata = {
-                "message": field.message(),
+                "message": md,
                 **metadata.extract(field.metadata()),
             }
 
@@ -97,6 +108,7 @@ class _FieldBuffer:
 
         coord_values = zip(*self.values)
         unique = (sorted(set(values)) for values in coord_values)
+
         coords = {dim: c for dim, c in zip(self.dims[:-2], unique)}
 
         if missing := [
@@ -108,27 +120,27 @@ class _FieldBuffer:
             logger.exception(msg)
             raise RuntimeError(msg)
 
+
+
         ny, nx = next(iter(self.values.values())).shape
         shape = tuple(len(v) for v in coords.values()) + (ny, nx)
         return coords, shape
 
-    def _gather_tcoords(self):
-        time = None
-        valid_time = []
-        for step in sorted(self.time_meta):
-            tm = self.time_meta[step]
-            valid_time.append(_parse_datetime(tm["validityDate"], tm["validityTime"]))
-            if time is None:
-                time = _parse_datetime(tm["dataDate"], tm["dataTime"])
+    def _gather_tcoords(self, coords):
+        import itertools
+        import datetime
+        vtime_coords = np.empty(shape=(len(coords['ref_time'])*len(coords['time'])), dtype=datetime.datetime)
 
-        return {"valid_time": ("time", valid_time), "ref_time": time}
+        for idx, (ref_time,step) in enumerate(itertools.product(coords['ref_time'], coords['time'])):
+            vtime_coords[idx] = _parse_datetime(self.time_meta[(ref_time, step)]['validityDate'], self.time_meta[(ref_time, step)]['validityTime'])
+        return {'valid_time': (("ref_time","time"), np.reshape(vtime_coords, (len(coords['ref_time']), len(coords['time']))))}
 
     def to_xarray(self) -> xr.DataArray:
         if not self.values:
             raise MissingData("No values.")
 
         coords, shape = self._gather_coords()
-        tcoords = self._gather_tcoords()
+        tcoords = self._gather_tcoords(coords)
 
         array = xr.DataArray(
             data=np.array(
@@ -146,12 +158,10 @@ class _FieldBuffer:
 
 
 def _load_buffer_map(
-    source: data_source.DataSource,
-    request: Request,
+    field_list,
 ) -> dict[str, _FieldBuffer]:
-    logger.info("Retrieving request: %s", request)
-    fs = source.retrieve(request)
-
+    fs = field_list
+    
     buffer_map: dict[str, _FieldBuffer] = {}
 
     for field in fs:
@@ -161,6 +171,15 @@ def _load_buffer_map(
 
     return buffer_map
 
+
+def _load_buffer_map_from_source(
+    source: data_source.DataSource,
+    request: Request,
+) -> dict[str, _FieldBuffer]:
+    logger.info("Retrieving request: %s", request)
+    fs = source.retrieve(request)
+
+    return _load_buffer_map(fs)
 
 def load_single_param(
     source: data_source.DataSource,
@@ -195,7 +214,7 @@ def load_single_param(
     ):
         raise ValueError("Only one param is supported.")
 
-    buffer_map = _load_buffer_map(source, request)
+    buffer_map = _load_buffer_map_from_source(source, request)
     [buffer] = buffer_map.values()
     return buffer.to_xarray()
 
@@ -224,7 +243,39 @@ def load(
         A mapping of shortName to data arrays of the requested fields.
 
     """
-    buffer_map = _load_buffer_map(source, request)
+    buffer_map = _load_buffer_map_from_source(source, request)
+    result = {}
+    for name, buffer in buffer_map.items():
+        try:
+            result[name] = buffer.to_xarray()
+        except MissingData as e:
+            raise RuntimeError(f"Missing data for param: {name}") from e
+    return result
+
+def load_fieldlist(
+    fieldlist,
+) -> dict[str, xr.DataArray]:
+    """Request data from a data source.
+
+    Parameters
+    ----------
+    source : data_source.DataSource
+        Source to request the data from.
+    request : str | tuple[str, str] | dict[str, Any] | meteodatalab.mars.Request
+        Request for data from the source in the mars language.
+
+    Raises
+    ------
+    RuntimeError
+        when all of the requested data is not returned from the data source.
+
+    Returns
+    -------
+    dict[str, xarray.DataArray]
+        A mapping of shortName to data arrays of the requested fields.
+
+    """
+    buffer_map = _load_buffer_map(fieldlist)
     result = {}
     for name, buffer in buffer_map.items():
         try:
@@ -351,8 +402,9 @@ def save(
         msg = "The message attribute is required to write to the GRIB format."
         raise ValueError(msg)
 
-    stream = io.BytesIO(field.message)
-    [md] = (f.metadata() for f in ekd.from_source("stream", stream))
+#    stream = io.BytesIO(field.message)
+#    [md] = (f.metadata() for f in ekd.from_source("stream", stream))
+    md = field.message
 
     idx = {
         dim: field.coords[key]
@@ -361,7 +413,14 @@ def save(
     }
 
     def to_grib(loc: dict[str, xr.DataArray]):
-        return {INV_DIM_MAP[key]: value.item() for key, value in loc.items()}
+        result={}
+        for key,value in loc.items():
+            if key == "ref_time":
+                result["dataDate"] = value.item().strftime("%Y%m%d")
+                result["dataTime"] = value.item().strftime("%H%M")
+            else:
+                result[INV_DIM_MAP[key]]= value.item()
+        return result
 
     for idx_slice in product(*idx.values()):
         loc = {dim: value for dim, value in zip(idx.keys(), idx_slice)}
@@ -371,6 +430,66 @@ def save(
         fs = ekd.FieldList.from_numpy(array, metadata)
         fs.write(file_handle, bits_per_value=bits_per_value)
 
+def to_fieldlist(
+    field: xr.DataArray,
+    bits_per_value: int = 16,
+):
+    """Write field to file in GRIB format.
+
+    Parameters
+    ----------
+    field : xarray.DataArray
+        Field to write into the output file.
+    file_handle : io.BufferedWriter
+        File handle for the output file.
+    bits_per_value : int, optional
+        Bits per value encoded in the output file. (Default: 16)
+
+    Raises
+    ------
+    ValueError
+        If the field does not have a message attribute.
+
+    """
+    if not hasattr(field, "message"):
+        msg = "The message attribute is required to write to the GRIB format."
+        raise ValueError(msg)
+
+#    stream = io.BytesIO(field.message)
+#    [md] = (f.metadata() for f in ekd.from_source("stream", stream))
+    md = field.message    
+
+    idx = {
+        dim: field.coords[key]
+        for key in field.dims
+        if (dim := str(key)) not in {"x", "y"}
+    }
+
+    def to_grib(loc: dict[str, xr.DataArray]):
+        loc.pop('eps', None)
+        result={}
+        for key,value in loc.items():
+            if key == "ref_time":
+# TODO assert there is only 1 value
+                import datetime
+                import pandas as pd
+                date = pd.Timestamp(value.values).to_pydatetime()
+#                date = datetime.datetime.fromtimestamp(value.item())
+                result["dataDate"] = date.strftime("%Y%m%d")
+                result["dataTime"] = date.strftime("%H%M")
+            else:
+                result[INV_DIM_MAP[key]]= value.item()
+        return result
+
+    fl = ekd.FieldList()
+
+    for idx_slice in product(*idx.values()):
+        loc = {dim: value for dim, value in zip(idx.keys(), idx_slice)}
+        array = field.sel(loc).values
+        metadata = md.override( to_grib(loc) )
+        fl = fl + ekd.FieldList.from_numpy(array, metadata)
+
+    return fl
 
 def get_code_flag(value: int, indices: Sequence[int]) -> list[bool]:
     """Get the code flag value at the given indices.
