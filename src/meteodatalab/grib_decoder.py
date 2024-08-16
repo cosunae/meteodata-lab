@@ -418,7 +418,7 @@ def save(
             if key == "ref_time":
                 result["dataDate"] = value.item().strftime("%Y%m%d")
                 result["dataTime"] = value.item().strftime("%H%M")
-            else:
+            elif key != 'pressure':
                 result[INV_DIM_MAP[key]]= value.item()
         return result
 
@@ -426,6 +426,8 @@ def save(
         loc = {dim: value for dim, value in zip(idx.keys(), idx_slice)}
         array = field.sel(loc).values
         metadata = md.override(to_grib(loc))
+        if 'pressure' in loc:
+            metadata = metadata.override({'scaledValueOfFirstFixedSurface': loc['pressure'].values})
 
         fs = ekd.FieldList.from_numpy(array, metadata)
         fs.write(file_handle, bits_per_value=bits_per_value)
@@ -477,7 +479,7 @@ def to_fieldlist(
 #                date = datetime.datetime.fromtimestamp(value.item())
                 result["dataDate"] = date.strftime("%Y%m%d")
                 result["dataTime"] = date.strftime("%H%M")
-            else:
+            elif key != 'pressure':
                 result[INV_DIM_MAP[key]]= value.item()
         return result
 
@@ -487,6 +489,8 @@ def to_fieldlist(
         loc = {dim: value for dim, value in zip(idx.keys(), idx_slice)}
         array = field.sel(loc).values
         metadata = md.override( to_grib(loc) )
+        if 'pressure' in loc:
+            metadata = metadata.override({'level': loc['pressure'].values})
         fl = fl + ekd.FieldList.from_numpy(array, metadata)
 
     return fl
